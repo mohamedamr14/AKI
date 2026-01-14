@@ -1,0 +1,272 @@
+############################################################
+# Diagnostic Accuracy Meta-Analysis of Serum Cystatin C for AKI
+# Pediatric Populations
+#
+# Author: Mohamed Elkarargy
+# Software: R 4.3.1
+#
+# This script performs:
+# - Data preparation
+# - Bivariate Reitsma meta-analysis
+# - Bayesian HSROC modeling
+# - Forest plots (Sensitivity & Specificity)
+# - SROC curves with posterior uncertainty
+# - Predictive value estimation
+# - Bayesian meta-regression on AUC
+# - Heterogeneity, influence, and publication bias analyses
+############################################################
+
+
+############################
+# 0. Load Required Packages
+############################
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(mada)
+library(meta)
+library(metafor)
+library(brms)
+library(INLA)
+library(meta4diag)
+library(bayesplot)
+library(tidybayes)
+library(patchwork)
+library(scales)
+
+theme_set(theme_minimal(base_size = 14))
+
+
+############################
+# 1. Data Preparation
+############################
+
+# Rename diagnostic accuracy columns to standard format
+colnames(cyy3)[colnames(cyy3) == "tp"] <- "TP"
+colnames(cyy3)[colnames(cyy3) == "fp"] <- "FP"
+colnames(cyy3)[colnames(cyy3) == "tn"] <- "TN"
+colnames(cyy3)[colnames(cyy3) == "fn"] <- "FN"
+
+# Add study ID
+cyy3$id <- factor(seq_len(nrow(cyy3)))
+
+# Create mada object
+md <- madad(cyy3)
+
+
+############################
+# 2. Bivariate Random-Effects Meta-Analysis (Reitsma)
+############################
+
+reitsma_model <- reitsma(md)
+summary(reitsma_model)
+
+
+############################
+# 3. Forest Plots (Sensitivity & Specificity)
+############################
+
+# Sensitivity forest plot
+mada::forest(
+  md,
+  type = "sens",
+  main = "Sensitivity of Cystatin C for AKI Diagnosis",
+  xlab = "Sensitivity",
+  snames = cyy3$id,
+  col = "black",
+  pch = 19,
+  cex = 0.9,
+  lwd = 1.5
+)
+
+# Specificity forest plot
+mada::forest(
+  md,
+  type = "spec",
+  main = "Specificity of Cystatin C for AKI Diagnosis",
+  xlab = "Specificity",
+  snames = cyy3$id,
+  col = "black",
+  pch = 19,
+  cex = 0.9,
+  lwd = 1.5
+)
+
+
+############################
+# 4. Bayesian HSROC Model
+############################
+
+posterior <- as_draws_df(biv_model) %>%
+  mutate(
+    Se = plogis(b_measureSe),
+    Sp = plogis(b_measureSp),
+    FPR = 1 - Sp,
+    theta = (qlogis(Se) - qlogis(FPR)) / 2,
+    alpha = (qlogis(Se) + qlogis(FPR)) / 2,
+    AUC = pnorm(theta * sqrt(2))
+  )
+
+# Posterior summaries
+theta_ci <- quantile(posterior$theta, c(0.025, 0.975))
+alpha_ci <- quantile(posterior$alpha, c(0.025, 0.975))
+auc_ci   <- quantile(posterior$AUC,   c(0.025, 0.975))
+
+
+############################
+# 5. SROC Curve with Posterior Uncertainty
+############################
+
+set.seed(123)
+posterior_sample <- posterior %>% sample_n(1000)
+
+ggplot(posterior_sample, aes(x = FPR, y = Se)) +
+  geom_point(alpha = 0.05, color = "blue") +
+  geom_point(
+    aes(x = 1 - mean(posterior$Sp), y = mean(posterior$Se)),
+    color = "red",
+    size = 3
+  ) +
+  labs(
+    x = "1 - Specificity (False Positive Rate)",
+    y = "Sensitivity (True Positive Rate)",
+    title = "SROC Curve with Posterior Uncertainty"
+  )
+
+
+############################
+# 6. Study-Level Points on SROC
+############################
+
+meta_long <- meta_forest %>%
+  select(studynames, Sens, Spec) %>%
+  pivot_longer(cols = c(Sens, Spec),
+               names_to = "Metric",
+               values_to = "Estimate") %>%
+  pivot_wider(names_from = Metric, values_from = Estimate) %>%
+  mutate(FPR = 1 - Spec)
+
+ggplot() +
+  geom_point(data = posterior_sample,
+             aes(x = FPR, y = Se),
+             alpha = 0.05,
+             color = "blue") +
+  geom_point(
+    aes(x = 1 - mean(posterior$Sp), y = mean(posterior$Se)),
+    color = "red",
+    size = 3
+  ) +
+  geom_point(
+    data = meta_long,
+    aes(x = FPR, y = Sens),
+    color = "black",
+    size = 2
+  ) +
+  labs(
+    x = "False Positive Rate",
+    y = "Sensitivity",
+    title = "SROC Posterior Distribution with Study Estimates"
+  )
+
+
+############################
+# 7. Predictive Values Across Prevalence
+############################
+
+prev <- c(0.10, 0.25, 0.40)
+Se <- mean(posterior$Se)
+Sp <- mean(posterior$Sp)
+
+ppv <- (Se * prev) / ((Se * prev) + ((1 - Sp) * (1 - prev)))
+npv <- (Sp * (1 - prev)) / (((1 - Se) * prev) + (Sp * (1 - prev)))
+
+predictive_values <- data.frame(
+  Prevalence = prev,
+  PPV = round(ppv * 100, 1),
+  NPV = round(npv * 100, 1)
+)
+
+predictive_values
+
+
+############################
+# 8. Bayesian Meta-Regression on Logit AUC
+############################
+
+# Predicted vs observed AUC
+cyy3$predicted <- posterior_epred(fit, summary = TRUE)[, "Estimate"]
+
+inv_logit <- function(x) exp(x) / (1 + exp(x))
+cyy3$pred_auc <- inv_logit(cyy3$predicted)
+cyy3$true_auc <- inv_logit(cyy3$logit_auc)
+
+ggplot(cyy3, aes(x = pred_auc, y = true_auc)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Predicted AUC", y = "Observed AUC")
+
+
+############################
+# 9. Conditional Effects
+############################
+
+p_age <- plot(conditional_effects(fit, effects = "age"), plot = FALSE)[[1]]
+p_n   <- plot(conditional_effects(fit, effects = "n"), plot = FALSE)[[1]]
+p_mp  <- plot(conditional_effects(fit2, effects = "m_p"), plot = FALSE)[[1]]
+p_set <- plot(conditional_effects(fit1, effects = "setting"), plot = FALSE)[[1]]
+
+(p_age | p_n) / (p_mp | p_set)
+
+
+############################
+# 10. Posterior Distributions
+############################
+
+color_scheme_set("blue")
+
+mcmc_areas(
+  fit,
+  pars = c("b_Intercept", "b_age", "b_n"),
+  prob = 0.95
+)
+
+mcmc_areas(
+  fit1,
+  pars = c("b_Intercept", "b_settingward"),
+  prob = 0.95
+)
+
+
+############################
+# 11. Influence & Publication Bias
+############################
+
+# Deeks funnel plot (metafor)
+sens <- escalc(
+  data = cyy3,
+  ai = TP, bi = FP, ci = FN, di = TN,
+  measure = "DOR"
+)
+
+rma_dor <- rma(sens, vi = vi)
+funnel(rma_dor, col = "red4")
+
+# Bayesian funnel (INLA)
+meta_inla <- meta4diag(
+  data = cyy3,
+  model.type = 1,
+  var2.prior = "PC",
+  var2.par = c(1, 0.05),
+  nsample = 10000
+)
+
+meta4diag::funnel.meta4diag(
+  meta_inla,
+  main = "Deeks Funnel Plot (Bayesian)"
+)
+
+
+############################
+# END OF SCRIPT
+############################
